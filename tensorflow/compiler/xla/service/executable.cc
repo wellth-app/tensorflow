@@ -17,30 +17,32 @@ limitations under the License.
 
 #include "tensorflow/compiler/xla/legacy_flags/debug_options_flags.h"
 #include "tensorflow/compiler/xla/service/hlo_graph_dumper.h"
+#include "tensorflow/compiler/xla/status.h"
 #include "tensorflow/compiler/xla/status_macros.h"
+#include "tensorflow/core/lib/hash/hash.h"
 #include "tensorflow/core/lib/io/path.h"
 #include "tensorflow/core/lib/strings/stringprintf.h"
 #include "tensorflow/core/platform/env.h"
 
 namespace xla {
 
-StatusOr<std::vector<perftools::gputools::DeviceMemoryBase>>
+StatusOr<std::vector<std::unique_ptr<ShapedBuffer>>>
 Executable::ExecuteOnStreams(
     tensorflow::gtl::ArraySlice<const ServiceExecutableRunOptions> run_options,
     tensorflow::gtl::ArraySlice<
-        tensorflow::gtl::ArraySlice<perftools::gputools::DeviceMemoryBase>>
+        tensorflow::gtl::ArraySlice<const ShapedBuffer*>>
         arguments) {
   TF_RET_CHECK(run_options.size() == arguments.size());
 
+  std::vector<std::unique_ptr<ShapedBuffer>> return_values(run_options.size());
+
   if (run_options.size() == 1) {
-    TF_ASSIGN_OR_RETURN(auto result,
+    TF_ASSIGN_OR_RETURN(return_values[0],
                         ExecuteOnStream(&run_options[0], arguments[0],
                                         /*hlo_execution_profile=*/nullptr));
-    return std::vector<perftools::gputools::DeviceMemoryBase>({result});
+    return std::move(return_values);
   }
 
-  std::vector<perftools::gputools::DeviceMemoryBase> return_values(
-      run_options.size());
   for (size_t i = 0; i < run_options.size(); ++i) {
     // We cannot BlockHostUntilDone() on the already-launched executions in case
     // of error, since if the executions communicate, the initially launched
@@ -50,9 +52,9 @@ Executable::ExecuteOnStreams(
   }
   for (const auto& options : run_options) {
     TF_RET_CHECK(options.stream() != nullptr);
-    options.stream()->BlockHostUntilDone();
+    TF_RETURN_IF_ERROR(options.stream()->BlockHostUntilDone());
   }
-  return return_values;
+  return std::move(return_values);
 }
 
 Status Executable::DumpSessionModule() {
@@ -82,7 +84,11 @@ Status Executable::DumpSessionModule() {
   }
   filename = SanitizeFileName(std::move(filename));
   string file_path = tensorflow::io::JoinPath(directory_path, filename);
-  return tensorflow::WriteBinaryProto(env, file_path, session_module);
+  string result;
+  TF_RET_CHECK(
+      tensorflow::SerializeToStringDeterministic(session_module, &result));
+  return tensorflow::WriteStringToFile(tensorflow::Env::Default(), file_path,
+                                       result);
 }
 
 }  // namespace xla

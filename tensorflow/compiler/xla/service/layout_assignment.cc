@@ -477,16 +477,10 @@ Status LayoutAssignment::AddMandatoryConstraints(
           /*mandatory=*/true));
     } else if (instruction->opcode() == HloOpcode::kCustomCall) {
       // Add constraints for kCustomCall instruction operands and instructions.
-      // For now we only support row major layouts for all inputs and outputs.
-      auto row_major_shape = [](const Shape& old_shape) {
-        Shape new_shape(old_shape);
-        std::vector<int64> dimension_order(new_shape.dimensions_size());
-        std::iota(dimension_order.rbegin(), dimension_order.rend(), 0);
-        *new_shape.mutable_layout() = LayoutUtil::MakeLayout(dimension_order);
-        return new_shape;
-      };
-
-      Shape result_shape(row_major_shape(instruction->shape()));
+      // For now we only support major-first layouts for all inputs and outputs.
+      Shape result_shape = ShapeUtil::MakeShapeWithDescendingLayout(
+          instruction->shape().element_type(),
+          AsInt64Slice(instruction->shape().dimensions()));
       TF_RETURN_IF_ERROR(
           constraints->SetInstructionLayout(result_shape, instruction));
       for (int64 i = 0; i < instruction->operand_count(); ++i) {
@@ -496,7 +490,10 @@ Status LayoutAssignment::AddMandatoryConstraints(
           continue;
         }
 
-        Shape row_major_operand_shape(row_major_shape(operand_shape));
+        Shape row_major_operand_shape =
+            ShapeUtil::MakeShapeWithDescendingLayout(
+                operand_shape.element_type(),
+                AsInt64Slice(operand_shape.dimensions()));
         TF_RETURN_IF_ERROR(constraints->SetOperandLayout(
             row_major_operand_shape, instruction, i, /*mandatory=*/true));
       }
@@ -530,9 +527,11 @@ Status CheckCallLayout(HloInstruction* call,
 Status CheckCustomCallLayout(HloInstruction* custom_call) {
   for (const HloInstruction* operand : custom_call->operands()) {
     TF_RET_CHECK(
+        ShapeUtil::IsOpaque(operand->shape()) ||
         LayoutUtil::IsMonotonicWithDim0Major(operand->shape().layout()));
   }
   TF_RET_CHECK(
+      ShapeUtil::IsOpaque(custom_call->shape()) ||
       LayoutUtil::IsMonotonicWithDim0Major(custom_call->shape().layout()));
   return Status::OK();
 }
@@ -711,8 +710,8 @@ std::unique_ptr<Layout> LayoutAssignment::ChooseOperandLayoutFromOutputLayout(
     int64 operand_no) {
   const HloInstruction* operand = instruction->operand(operand_no);
 
-  CHECK(ShapeUtil::IsArray(instruction->shape()) &&
-        ShapeUtil::IsArray(operand->shape()));
+  CHECK(ShapeUtil::IsArray(instruction->shape()));
+  CHECK(ShapeUtil::IsArray(operand->shape()));
 
   if (instruction->IsElementwiseOnOperand(operand_no) &&
       !ShapeUtil::IsScalar(operand->shape()) &&
@@ -732,7 +731,8 @@ std::unique_ptr<Layout> LayoutAssignment::ChooseOperandLayoutFromOutputLayout(
     // dimension bound is 1 in the operand shape, there may be several such
     // layouts. So if 'output_layout' is the default layout, try if the
     // reshape is a bitcast when using the same layout. This may avoid copy
-    // operations.
+    // operations. For similar reasons, if the operand and output have the same
+    // rank, try to match the operand's layout to the output.
     if (ShapeUtil::TrueRank(operand->shape()) == 1 &&
         ShapeUtil::Rank(instruction->shape()) == 1) {
       // Don't assign a layout in case of R1 -> effective R1 reshape.
@@ -741,12 +741,19 @@ std::unique_ptr<Layout> LayoutAssignment::ChooseOperandLayoutFromOutputLayout(
     const Shape& output_shape = instruction->shape();
     Shape output_shape_with_layout = ShapeUtil::MakeShapeWithLayout(
         output_shape.element_type(), AsInt64Slice(output_shape.dimensions()),
-        AsInt64Slice(output_layout.minor_to_major()));
+        LayoutUtil::MinorToMajor(output_layout));
     Shape operand_shape = operand->shape();
     *operand_shape.mutable_layout() =
         LayoutUtil::GetDefaultLayoutForShape(operand_shape);
     if (ShapeUtil::ReshapeIsBitcast(operand_shape, output_shape_with_layout)) {
       return MakeUnique<Layout>(operand_shape.layout());
+    }
+    if (ShapeUtil::Rank(operand_shape) == ShapeUtil::Rank(output_shape)) {
+      *operand_shape.mutable_layout() = output_layout;
+      if (ShapeUtil::ReshapeIsBitcast(operand_shape,
+                                      output_shape_with_layout)) {
+        return MakeUnique<Layout>(output_layout);
+      }
     }
     auto aligned_operand_shape =
         ShapeUtil::AlignLayouts(output_shape_with_layout, operand_shape);
@@ -763,7 +770,7 @@ std::unique_ptr<Layout> LayoutAssignment::ChooseOperandLayoutFromOutputLayout(
     int64 rank = ShapeUtil::Rank(instruction->shape());
     std::vector<int64> new_minor_to_major(rank);
     for (int64 i = 0; i < rank; ++i) {
-      int64 output_dim = output_layout.minor_to_major(i);
+      int64 output_dim = LayoutUtil::Minor(output_layout, i);
       int64 operand_dim = instruction->dimensions(output_dim);
       new_minor_to_major[i] = operand_dim;
     }
@@ -796,7 +803,8 @@ std::unique_ptr<Layout> LayoutAssignment::ChooseOutputLayoutFromOperandLayout(
     // dimension bound is 1 in the user shape, there may be several such
     // layouts. So if 'operand_layout' is the default layout, try if the
     // reshape is a bitcast when using the same layout. This may avoid copy
-    // operations.
+    // operations. For similar reasons, if the operand and output have the same
+    // rank, try to match the outputs's layout to the operand.
     if (ShapeUtil::Rank(operand->shape()) == 1 &&
         ShapeUtil::TrueRank(user->shape()) == 1) {
       // Don't assign a layout in case of R1 -> effective R1 reshape.
@@ -805,12 +813,19 @@ std::unique_ptr<Layout> LayoutAssignment::ChooseOutputLayoutFromOperandLayout(
     Shape operand_shape_with_layout = ShapeUtil::MakeShapeWithLayout(
         operand->shape().element_type(),
         AsInt64Slice(operand->shape().dimensions()),
-        AsInt64Slice(operand_layout.minor_to_major()));
+        LayoutUtil::MinorToMajor(operand_layout));
     Shape output_shape = user->shape();
     *output_shape.mutable_layout() =
         LayoutUtil::GetDefaultLayoutForShape(output_shape);
     if (ShapeUtil::ReshapeIsBitcast(output_shape, operand_shape_with_layout)) {
       return MakeUnique<Layout>(output_shape.layout());
+    }
+    if (ShapeUtil::Rank(operand->shape()) == ShapeUtil::Rank(output_shape)) {
+      *output_shape.mutable_layout() = operand_layout;
+      if (ShapeUtil::ReshapeIsBitcast(output_shape,
+                                      operand_shape_with_layout)) {
+        return MakeUnique<Layout>(operand_layout);
+      }
     }
     auto aligned_user_shape =
         ShapeUtil::AlignLayouts(operand_shape_with_layout, output_shape);
@@ -828,7 +843,7 @@ std::unique_ptr<Layout> LayoutAssignment::ChooseOutputLayoutFromOperandLayout(
     std::vector<int64> new_minor_to_major(rank);
     auto inverse_dimensions = InversePermutation(user->dimensions());
     for (int64 i = 0; i < rank; ++i) {
-      int64 operand_dim = operand_layout.minor_to_major(i);
+      int64 operand_dim = LayoutUtil::Minor(operand_layout, i);
       int64 user_dim = inverse_dimensions[operand_dim];
       new_minor_to_major[i] = user_dim;
     }
@@ -1180,8 +1195,6 @@ Status CopyOperandIfLayoutsDiffer(const ShapeLayout& operand_layout,
 // to match the layout of its corresponding fusion instruction operand. Also,
 // set the layout of the fused root to match the layout of the fusion
 // instruction itself.
-// Fused GetTupleElement requires a layout so that TBAA metadata for the tuple
-// element array pointer load can be added.
 Status SetFusionLayouts(HloInstruction* fusion) {
   TF_RET_CHECK(fusion->opcode() == HloOpcode::kFusion);
   for (auto* fused_instruction : fusion->fused_instructions()) {
@@ -1289,7 +1302,7 @@ Status LayoutAssignment::AssignLayouts(const LayoutConstraints& constraints,
     TF_RET_CHECK(LayoutUtil::HasLayout(instruction->shape()));
   }
 
-  // Copy the root instrucion's result if the it does not match the result
+  // Copy the root instruction's result if the it does not match the result
   // layout constraint
   if (constraints.ResultLayout() != nullptr &&
       !constraints.ResultLayout()->MatchesLayoutInShape(
@@ -1313,6 +1326,20 @@ Status LayoutAssignment::RunOnComputation(
   VLOG(2) << "LayoutAssignment::RunOnComputation(" << computation->name()
           << ")";
   VLOG(2) << "  ComputationLayout = " << computation_layout.ToString();
+
+  // Clear existing layouts of the instructions. All layouts must be assigned by
+  // the LayoutAssignment pass, except for Infeed, Outfeed, Parameters and the
+  // computation result. The latter two are specified in computation_layout, so
+  // we only need to keep the existing layouts for Infeed and Outfeed. Clearing
+  // the layouts here avoids hiding potential bugs in the layout assignment pass
+  // that may accidently use the existing layout.
+  for (HloInstruction* instruction : computation->instructions()) {
+    if (instruction->opcode() == HloOpcode::kInfeed ||
+        instruction->opcode() == HloOpcode::kOutfeed) {
+      continue;
+    }
+    LayoutUtil::ClearLayout(instruction->mutable_shape());
+  }
 
   // Construct LayoutConstraints with all layout constraints of the computation.
   LayoutConstraints constraints(points_to_analysis, computation);

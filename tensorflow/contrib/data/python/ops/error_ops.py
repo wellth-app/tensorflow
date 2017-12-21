@@ -19,6 +19,7 @@ from __future__ import print_function
 
 from tensorflow.python.data.ops import dataset_ops
 from tensorflow.python.data.util import nest
+from tensorflow.python.data.util import sparse
 from tensorflow.python.ops import gen_dataset_ops
 
 
@@ -30,7 +31,7 @@ def ignore_errors():
   example:
 
   ```python
-  dataset = tf.contrib.data.Dataset.from_tensor_slices([1., 2., 0., 4.])
+  dataset = tf.data.Dataset.from_tensor_slices([1., 2., 0., 4.])
 
   # Computing `tf.check_numerics(1. / 0.)` will raise an InvalidArgumentError.
   dataset = dataset.map(lambda x: tf.check_numerics(1. / x, "error"))
@@ -42,7 +43,7 @@ def ignore_errors():
 
   Returns:
     A `Dataset` transformation function, which can be passed to
-    @{tf.contrib.data.Dataset.apply}.
+    @{tf.data.Dataset.apply}.
   """
 
   def _apply_fn(dataset):
@@ -62,8 +63,14 @@ class IgnoreErrorsDataset(dataset_ops.Dataset):
   def _as_variant_tensor(self):
     return gen_dataset_ops.ignore_errors_dataset(
         self._input_dataset._as_variant_tensor(),  # pylint: disable=protected-access
-        output_shapes=nest.flatten(self.output_shapes),
-        output_types=nest.flatten(self.output_types))
+        output_shapes=nest.flatten(
+            sparse.as_dense_shapes(self.output_shapes, self.output_classes)),
+        output_types=nest.flatten(
+            sparse.as_dense_types(self.output_types, self.output_classes)))
+
+  @property
+  def output_classes(self):
+    return self._input_dataset.output_classes
 
   @property
   def output_shapes(self):
