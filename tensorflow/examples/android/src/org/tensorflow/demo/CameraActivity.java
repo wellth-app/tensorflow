@@ -57,7 +57,7 @@ public abstract class CameraActivity extends Activity
 
   private Handler handler;
   private HandlerThread handlerThread;
-  private boolean useCamera2API;
+  private boolean useCamera2API = true;
   private boolean isProcessingFrame = false;
   private byte[][] yuvBytes = new byte[3][];
   private int[] rgbBytes = null;
