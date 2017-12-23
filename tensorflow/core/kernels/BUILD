@@ -4677,7 +4677,6 @@ filegroup(
     name = "android_extended_ops_group1",
     srcs = [
         "argmax_op.cc",
-        "control_flow_ops.cc",
         "avgpooling_op.cc",
         "batch_matmul_op_real.cc",
         "batch_norm_op.cc",
